@@ -12,9 +12,6 @@ from langchain_openai import ChatOpenAI
 from langchain.output_parsers import StructuredOutputParser, ResponseSchema, OutputFixingParser
 from langchain.prompts import PromptTemplate
 
-# -------------------------------
-# CONFIG
-# -------------------------------
 FOURSQUARE_HEADERS = {
     "Accept": "application/json",
     "Authorization": "Bearer ORZXI10T25IROQ4QSCWVFD0OE2SZZQKCEDYQQADLRHHUVXAC",
@@ -30,9 +27,6 @@ llm = ChatOpenAI(
     temperature=0,
 )
 
-# -------------------------------
-# LLM Parsing Setup
-# -------------------------------
 response_schemas = [
     ResponseSchema(
         name="place_type",
@@ -69,9 +63,6 @@ IMPORTANT: Return only valid JSON.
     partial_variables={"format_instructions": format_instructions},
 )
 
-# -------------------------------
-# Parsing function
-# -------------------------------
 def parse_with_llm(query: str, llm):
     # Step 1: Translate to English first
     translation_prompt = f"""
@@ -89,9 +80,6 @@ Return only the translated text.
     # Step 3: Return English place_type/location
     return parsed_result
 
-# -------------------------------
-# Foursquare & Weather APIs
-# -------------------------------
 @lru_cache(maxsize=100)
 def search_places(query: str, location: str, limit: int = 5) -> str:
     url = "https://places-api.foursquare.com/places/search"
@@ -131,9 +119,6 @@ def get_weather(location: str, hours: int = 24) -> str:
     else:
         return f"Error fetching forecast: {res.status_code}"
 
-# -------------------------------
-# Refinement function
-# -------------------------------
 def refine_results(user_query: str, previous_results: str, descriptors: str, location: str, weather) -> str:
     refine_prompt = f"""
 User asked (keep answer in the same language as this query): {user_query}
@@ -152,9 +137,6 @@ Return top suggestions in 4 bullet points in this format:
     final_response = llm.invoke(refine_prompt)
     return final_response.content
 
-# -------------------------------
-# FastAPI
-# -------------------------------
 app = FastAPI(title="Smart Places Recommender", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
