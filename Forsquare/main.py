@@ -1,0 +1,204 @@
+import os
+import time
+import requests
+from functools import lru_cache
+from typing import Dict, Any, Optional
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from langchain_openai import ChatOpenAI
+from langchain.output_parsers import StructuredOutputParser, ResponseSchema, OutputFixingParser
+from langchain.prompts import PromptTemplate
+
+# -------------------------------
+# CONFIG
+# -------------------------------
+FOURSQUARE_HEADERS = {
+    "Accept": "application/json",
+    "Authorization": "Bearer ORZXI10T25IROQ4QSCWVFD0OE2SZZQKCEDYQQADLRHHUVXAC",
+    "X-Places-Api-Version": "2025-06-17",
+}
+
+WEATHER_API_KEY = "535dcd3df0814b44a24143609253008"
+
+llm = ChatOpenAI(
+    openai_api_key="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",
+    openai_api_base="https://api.groq.com/openai/v1",
+    model="llama-3.1-8b-instant",
+    temperature=0,
+)
+
+# -------------------------------
+# LLM Parsing Setup
+# -------------------------------
+response_schemas = [
+    ResponseSchema(
+        name="place_type",
+        description="The type of place user is asking for (restaurant, hospital, cafe, shopping, etc.)",
+    ),
+    ResponseSchema(
+        name="location",
+        description="The city, town, or neighborhood mentioned. Default 'Bengaluru'.",
+    ),
+    ResponseSchema(
+        name="descriptors",
+        description="Extra adjectives or constraints like romantic, cheap, gluten-free, women-safety, etc.",
+    ),
+]
+
+output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
+fixed_parser = OutputFixingParser.from_llm(parser=output_parser, llm=llm)
+format_instructions = output_parser.get_format_instructions()
+
+prompt = PromptTemplate(
+    template="""
+Extract the following from the user query:
+
+- place_type
+- location (default to 'Bengaluru' if missing)
+- descriptors
+
+User query: {query}
+
+{format_instructions}
+IMPORTANT: Return only valid JSON.
+""",
+    input_variables=["query"],
+    partial_variables={"format_instructions": format_instructions},
+)
+
+# -------------------------------
+# Parsing function
+# -------------------------------
+def parse_with_llm(query: str, llm):
+    # Step 1: Translate to English first
+    translation_prompt = f"""
+Translate the following query into English for accurate parsing:
+Query: {query}
+Return only the translated text.
+"""
+    translated_output = llm.invoke(translation_prompt).content.strip()
+
+    # Step 2: Parse translated query
+    _input = prompt.format_prompt(query=translated_output)
+    output = llm.invoke(_input.to_messages())
+    parsed_result = fixed_parser.parse(output.content)
+
+    # Step 3: Return English place_type/location
+    return parsed_result
+
+# -------------------------------
+# Foursquare & Weather APIs
+# -------------------------------
+@lru_cache(maxsize=100)
+def search_places(query: str, location: str, limit: int = 5) -> str:
+    url = "https://places-api.foursquare.com/places/search"
+    params = {"query": query, "near": location, "limit": limit}
+    res = requests.get(url, params=params, headers=FOURSQUARE_HEADERS)
+    if res.status_code == 200:
+        results = res.json().get("results", [])
+        if not results:
+            return "No results found."
+        places = []
+        for p in results:
+            name = p.get("name", "Unknown")
+            address = p.get("location", {}).get("formatted_address", "No address")
+            lat = p.get("latitude", "N/A")
+            lng = p.get("longitude", "N/A")
+            places.append(f"{name} - {address} (Lat: {lat}, Lng: {lng})")
+        return "\n".join(places)
+    else:
+        return f"Error: {res.status_code}"
+
+
+def get_weather(location: str, hours: int = 24) -> str:
+    url = "http://api.weatherapi.com/v1/forecast.json"
+    params = {"key": WEATHER_API_KEY, "q": location, "days": 2}
+    res = requests.get(url, params=params)
+    if res.status_code == 200:
+        data = res.json()
+        current_epoch = int(time.time())
+        forecast_hours = []
+        for day in data["forecast"]["forecastday"]:
+            forecast_hours.extend(day["hour"])
+        next_hours = [fh for fh in forecast_hours if fh["time_epoch"] >= current_epoch][:hours]
+        forecasts = []
+        for fh in next_hours:
+            forecasts.append(f"{fh['time']}: {fh['temp_c']}°C, {fh['condition']['text']}")
+        return "\n".join(forecasts) if forecasts else "No forecast available"
+    else:
+        return f"Error fetching forecast: {res.status_code}"
+
+# -------------------------------
+# Refinement function
+# -------------------------------
+def refine_results(user_query: str, previous_results: str, descriptors: str, location: str, weather) -> str:
+    refine_prompt = f"""
+User asked (keep answer in the same language as this query): {user_query}
+
+Previous results:
+{previous_results}
+
+Weather forecast for next 24 hours in {location}:
+{weather}
+
+Consider women safety and hygiene while ranking.
+Filter or rank results based on descriptors: {descriptors}.
+Return top suggestions in 4 bullet points in this format:
+1) <place_name> - <address> - <open & close time if available> - <why you chose it>
+"""
+    final_response = llm.invoke(refine_prompt)
+    return final_response.content
+
+# -------------------------------
+# FastAPI
+# -------------------------------
+app = FastAPI(title="Smart Places Recommender", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class QueryRequest(BaseModel):
+    query: str
+    previous_results: Optional[str] = None
+    filters: Optional[list] = None
+
+class RecommendationResponse(BaseModel):
+    query: str
+    parsed: Dict[str, Any]
+    raw_results: str
+    weather: str
+    recommendations: str
+
+@app.post("/recommend", response_model=RecommendationResponse)
+def recommend_places(req: QueryRequest):
+    parsed = parse_with_llm(req.query, llm)
+    place_type = parsed.get("place_type")
+    location = parsed.get("location", "Bengaluru")
+    descriptors = parsed.get("descriptors", "")
+
+    if req.previous_results and req.filters:
+        # Refine previous results using filters
+        search_results = req.previous_results
+        if req.filters:
+            descriptors += ", " + ", ".join(req.filters)
+    else:
+        # Fresh search
+        search_results = search_places(place_type, location)
+
+    weather = get_weather(location)
+    final_response = refine_results(req.query, search_results, descriptors, location, weather)
+
+    return {
+        "query": req.query,
+        "parsed": parsed,
+        "raw_results": search_results,
+        "weather": weather,
+        "recommendations": final_response,
+    }
